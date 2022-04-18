@@ -131,42 +131,6 @@ binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* 
   _fold f [a] = a
   _fold f (a:r) = f a (_fold f r)
 
-  ops :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-  ops = otherOps ++ numOps ++ numBoolOps
-
-  otherOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-  otherOps = [("+",addOp),(">>",bindOp),("&",andOp),("|",orOp),("==",eqOp)]
-
-  numOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-  numOps = fmap numOp <$> [("*",(*)),("/",div),("%",mod),("^",(^))]
-
-  numBoolOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-  numBoolOps = fmap numBoolOp <$> [(">",(>)),("<",(<)),(">=",(>=)),("<=",(<=))]
-
-  numOp op (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a `op` b
-  numOp _ _ _ = botError "Expected number"
-
-  numBoolOp op (IntVal a) (IntVal b) = pure . ValueExpr . BoolVal $ a `op` b
-  numBoolOp _ _ _ = botError "Expected number"
-
-  addOp (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a + b
-  addOp (TextVal a) (TextVal b) = pure . ValueExpr . TextVal $ a <> b
-  addOp _ _ = botError "Expected number or string"
-
-  bindOp (IOVal a) b = pure . ValueExpr . IOVal $ a >>= appExprSimplX b
-  bindOp _ _ = botError "Expected IO and function"
-
-  andOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a && b
-  andOp _ _ = botError "Expected boolean"
-
-  orOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a || b
-  orOp _ _ = botError "Expected boolean"
-
-  eqOp (IntVal  a) (IntVal  b) = pure . ValueExpr . BoolVal $ a == b
-  eqOp (TextVal a) (TextVal b) = pure . ValueExpr . BoolVal $ a == b
-  eqOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a == b
-  eqOp _ _ = botError "Expected number, string, or boolean"
-
 appParser :: (MonadProc m) => Parser (Code m -> Expr m)
 appParser = f <$> (sepBy2 subAppParser spaces) where
   f [a,b] vars = ReducibleExpr $ appExprSimplFX (a vars) (b vars)
@@ -193,6 +157,43 @@ codeFileParser = spaces >> optional (string "```") >> spaces >> codeParser <* sp
 
 parseCode :: (MonadProc m) => Text -> Either ParseError (Code m)
 parseCode = parse codeFileParser "Inputted function"
+
+
+ops :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
+ops = otherOps ++ numOps ++ numBoolOps
+
+otherOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
+otherOps = [("+",addOp),(">>",bindOp),("&",andOp),("|",orOp),("==",eqOp)]
+
+numOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
+numOps = fmap numOp <$> [("*",(*)),("/",div),("%",mod),("^",(^))]
+
+numBoolOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
+numBoolOps = fmap numBoolOp <$> [(">",(>)),("<",(<)),(">=",(>=)),("<=",(<=))]
+
+numOp op (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a `op` b
+numOp _ _ _ = botError "Expected number"
+
+numBoolOp op (IntVal a) (IntVal b) = pure . ValueExpr . BoolVal $ a `op` b
+numBoolOp _ _ _ = botError "Expected number"
+
+addOp (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a + b
+addOp (TextVal a) (TextVal b) = pure . ValueExpr . TextVal $ a <> b
+addOp _ _ = botError "Expected number or string"
+
+bindOp (IOVal a) b = pure . ValueExpr . IOVal $ a >>= appExprSimplX b
+bindOp _ _ = botError "Expected IO and function"
+
+andOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a && b
+andOp _ _ = botError "Expected boolean"
+
+orOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a || b
+orOp _ _ = botError "Expected boolean"
+
+eqOp (IntVal  a) (IntVal  b) = pure . ValueExpr . BoolVal $ a == b
+eqOp (TextVal a) (TextVal b) = pure . ValueExpr . BoolVal $ a == b
+eqOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a == b
+eqOp _ _ = botError "Expected number, string, or boolean"
 
 
 codeDefaults :: (MonadProc m) => [(Text, Expr m)]
