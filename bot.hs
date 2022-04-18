@@ -123,6 +123,7 @@ binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* 
   f a o b vars = ReducibleExpr $ do
     a' <- simplExpr $ a vars
     b' <- simplExpr $ b vars
+    payGas 1
     o a' b'
 
   opParser :: (MonadProc m) => Parser (Value m -> Value m -> m (Expr m))
