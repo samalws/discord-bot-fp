@@ -5,10 +5,12 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad ((>=>), void)
 import Control.Monad.IO.Class (liftIO, MonadIO)
-import Control.Monad.State (get, put, State, runState)
+import Control.Monad.Reader (ask, local)
+import Control.Monad.State (get, put, modify, State, runState)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except
-import Control.Monad.Trans.Reader (runReaderT, ask)
+import Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import Control.Monad.Trans.State (StateT, evalStateT)
 import Data.Default.Class (Default)
 import Data.Maybe (maybe)
 import Data.Text (Text, pack, unpack, isPrefixOf)
@@ -28,12 +30,14 @@ import qualified Discord.Requests as R
 -- TODO make it so typing negative integers (eg -5) works(?)
 -- TODO add floats?
 -- TODO writing to state variables, @ people, get time, RNG
+-- TODO remove unused imports (how?)
 
 type Gas = Int
 type PID = Int
 data ProcAllowance = Allowed | AllowedNoPrefix deriving Eq
 data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance }
 data LamBotState m = LamBotState { procList :: M.Map PID (ProcState m), procsAllowed :: M.Map ChannelId (M.Map PID ProcAllowance), maxPID :: Int }
+-- TODO procList should be a map to pointers not actual values
 
 instance Default (ProcState m) where
   def = ProcState { procCode = M.empty, procVars = M.empty, channelsAllowed = M.empty }
@@ -46,18 +50,24 @@ data Expr m = ValueExpr (Value m) | ReducibleExpr (m (Expr m))
 data Value m = IntVal Int | TextVal Text | BoolVal Bool | IOVal (m (Expr m)) | TupVal (Value m) (Value m) | FnVal (Value m -> m (Expr m)) | VoidVal
 
 
-type ProcMonad = ExceptT String DiscordHandler
+type ProcMonad = ExceptT String (ReaderT Int (StateT Int DiscordHandler))
 
 class (MonadIO m) => MonadProc m where
   payGas :: Int -> m ()
   getGas :: m Int
+  pushChanges :: m ()
+  descendStmt :: m a -> m a
+  getDepth :: m Int
   liftDiscord :: DiscordHandler a -> m a
   botError :: String -> m a
 
-instance MonadProc (ExceptT String DiscordHandler) where
-  payGas n = pure () -- TODO
-  getGas = pure 0 -- TODO
-  liftDiscord = lift
+instance MonadProc (ExceptT String (ReaderT Int (StateT Int DiscordHandler))) where
+  payGas n = modify (+ n)
+  getGas = get -- TODO what we really want is to get how much we have left, not how much we used
+  pushChanges = pure () -- TODO
+  descendStmt = local (+1)
+  getDepth = ask
+  liftDiscord = lift . lift . lift
   botError s = except (Left s)
 
 simplExpr :: (MonadProc m) => Expr m -> m (Value m)
@@ -78,21 +88,22 @@ runCode s msg pid fn = do
   let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
   let contentVal = TextVal $ messageContent msg
   let call a b = ReducibleExpr (appExprSimplF a b)
-  res <- runExceptT $ maybe (pure ()) (void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal)) fnCode
+  -- TODO runStateT not evalStateT, since we'll be writing to the global state eventually
+  res <- flip evalStateT 0 $ flip runReaderT 0 $ runExceptT $ maybe (pure ()) (void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal)) fnCode
   case res of
     Left e -> sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
     _ -> pure ()
 
-appExpr (FnVal f) x = payGas 1 >> f x
+appExpr (FnVal f) x = getDepth >>= payGas >> f x
 appExpr _ _ = botError "Expected function"
 
-appExprSimplX f x = simplExpr x >>= appExpr f
+appExprSimplX f x = descendStmt (simplExpr x) >>= appExpr f
 
-appExprSimplF f x = simplExpr f >>= flip appExpr x
+appExprSimplF f x = descendStmt (simplExpr f) >>= flip appExpr x
 
 appExprSimplFX f x = do
-  f' <- simplExpr f
-  x' <- simplExpr x
+  f' <- descendStmt (simplExpr f)
+  x' <- descendStmt (simplExpr x)
   appExpr f' x'
 
 
@@ -109,7 +120,7 @@ ifParser = f <$> g "if" <*> g "then" <*> (string "else" >> spaces >> exprParser)
   g s = string s >> spaces >> parenParser <* spaces
   f :: (MonadProc m) => (Code m -> Expr m) -> (Code m -> Expr m) -> (Code m -> Expr m) -> (Code m -> Expr m)
   f a b c v = ReducibleExpr $ do
-    a' <- simplExpr (a v)
+    a' <- descendStmt (simplExpr (a v))
     case a' of
       (BoolVal True) -> pure (b v)
       (BoolVal False) -> pure (c v)
@@ -132,7 +143,7 @@ voidParser = char '(' >> space >> char ')' >> pure (const (ValueExpr VoidVal))
 
 tupParser :: (MonadProc m) => Parser (Code m -> Expr m)
 tupParser = f <$> (char '(' >> exprParser <* spaces <* char ',') <*> (spaces >> exprParser <* char ')') where
-  f a b vars = ReducibleExpr $ ValueExpr <$> (TupVal <$> simplExpr (a vars) <*> simplExpr (b vars))
+  f a b vars = ReducibleExpr $ ValueExpr <$> (TupVal <$> descendStmt (simplExpr (a vars)) <*> descendStmt (simplExpr (b vars)))
 
 parenParser :: (MonadProc m) => Parser (Code m -> Expr m)
 parenParser = char '(' >> exprParser <* char ')'
@@ -145,8 +156,8 @@ lamParser = f <$> (char '\\' >> varNameParser) <*> (spaces >> exprParser) where
 binOpParser :: (MonadProc m) => Parser (Code m -> Expr m)
 binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* spaces) <*> try exprParser where
   f a o b vars = ReducibleExpr $ do
-    a' <- simplExpr $ a vars
-    b' <- simplExpr $ b vars
+    a' <- descendStmt . simplExpr $ a vars
+    b' <- descendStmt . simplExpr $ b vars
     payGas 1
     o a' b'
 
@@ -227,12 +238,11 @@ codeDefaults = [
     ("true",  ValueExpr . BoolVal $ True),
     ("substr", threeArityHelper substrFn),
     ("len", oneArityHelper lenFn),
-    ("log", oneArityHelper logFn),
     ("sendMsg", twoArityHelper sendFn),
-    ("delayMicroS", oneArityHelper delayMicroSFn),
-    ("delayMs", oneArityHelper delayMsFn),
-    ("delaySec", oneArityHelper delaySecFn),
-    ("getGas", ValueExpr . IOVal $ fmap (ValueExpr . IntVal) getGas),
+    ("delayMicroS", oneArityHelper (delayFn 1)),
+    ("delayMs", oneArityHelper (delayFn 1000)),
+    ("delaySec", oneArityHelper (delayFn 1000000)),
+    ("getGas", ValueExpr . IOVal $ payGas 1 >> fmap (ValueExpr . IntVal) getGas),
     ("pass", ValueExpr . IOVal . pure $ ValueExpr VoidVal)
   ]
 
@@ -246,20 +256,11 @@ substrFn _ _ _ = botError "Expected int, int, and string"
 lenFn (TextVal t) = pure . ValueExpr . IntVal $ T.length t
 lenFn _ = botError "Expected string"
 
-logFn (TextVal t) = pure . ValueExpr . IOVal $ (liftIO . putStrLn $ unpack t) >> pure (ValueExpr VoidVal)
-logFn _ = botError "Expected string"
-
-sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ liftDiscord (sendMsg (fromIntegral c) t) >> liftIO (threadDelay 500000) >> pure (ValueExpr VoidVal)
+sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ payGas 100 >> pushChanges >> liftDiscord (sendMsg (fromIntegral c) t) >> liftIO (threadDelay 500000) >> pure (ValueExpr VoidVal)
 sendFn _ _ = botError "Expected channel ID and string"
 
-delayMicroSFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay x) >> pure (ValueExpr VoidVal)
-delayMicroSFn _ = botError "Expected int"
-
-delayMsFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay (x * 1000)) >> pure (ValueExpr VoidVal)
-delayMsFn _ = botError "Expected int"
-
-delaySecFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay (x * 1000000)) >> pure (ValueExpr VoidVal)
-delaySecFn _ = botError "Expected int"
+delayFn mul (IntVal x) = pure . ValueExpr . IOVal $ payGas 5 >> pushChanges >> liftIO (threadDelay (mul * x)) >> pure (ValueExpr VoidVal)
+delayFn _ _ = botError "Expected int"
 
 sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
 sendMsgM m = sendMsg (messageChannelId m)
