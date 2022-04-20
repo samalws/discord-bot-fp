@@ -1,10 +1,9 @@
 {-# LANGUAGE OverloadedStrings, FlexibleInstances #-}
 
-import Prelude hiding (drop)
 import System.Environment (getEnv)
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Monad ((>=>))
+import Control.Monad ((>=>), void)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.State (get, put, State, runState)
 import Control.Monad.Trans.Class (lift)
@@ -12,7 +11,7 @@ import Control.Monad.Trans.Except
 import Control.Monad.Trans.Reader (runReaderT, ask)
 import Data.Default.Class (Default)
 import Data.Maybe (maybe)
-import Data.Text (Text, pack, unpack, isPrefixOf, drop)
+import Data.Text (Text, pack, unpack, isPrefixOf)
 import Discord
 import Discord.Types
 import Text.Parsec hiding (State)
@@ -20,7 +19,15 @@ import Text.Parsec.Text
 import qualified Control.Exception as E
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified Data.Text as T
 import qualified Discord.Requests as R
+
+-- TODO parse comments
+-- TODO make it so you dont need parens for if or binary operations
+-- TODO import other procs; do standard library by having "import 0"
+-- TODO make it so typing negative integers (eg -5) works(?)
+-- TODO add floats?
+-- TODO writing to state variables, @ people, get time, RNG
 
 type Gas = Int
 type PID = Int
@@ -43,11 +50,13 @@ type ProcMonad = ExceptT String DiscordHandler
 
 class (MonadIO m) => MonadProc m where
   payGas :: Int -> m ()
+  getGas :: m Int
   liftDiscord :: DiscordHandler a -> m a
   botError :: String -> m a
 
 instance MonadProc (ExceptT String DiscordHandler) where
   payGas n = pure () -- TODO
+  getGas = pure 0 -- TODO
   liftDiscord = lift
   botError s = except (Left s)
 
@@ -55,11 +64,11 @@ simplExpr :: (MonadProc m) => Expr m -> m (Value m)
 simplExpr (ValueExpr x) = pure x
 simplExpr (ReducibleExpr x) = x >>= simplExpr
 
-runExpr :: (MonadProc m) => Expr m -> m ()
+runExpr :: (MonadProc m) => Expr m -> m (Expr m)
 runExpr e = do
   e' <- simplExpr e
   case e' of
-    IOVal x -> x >> pure ()
+    IOVal x -> x
     _ -> botError "Expected IO"
 
 runCode :: TVar (LamBotState ProcMonad) -> Message -> PID -> Text -> DiscordHandler ()
@@ -69,7 +78,7 @@ runCode s msg pid fn = do
   let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
   let contentVal = TextVal $ messageContent msg
   let call a b = ReducibleExpr (appExprSimplF a b)
-  res <- runExceptT $ maybe (pure ()) (runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal)) fnCode
+  res <- runExceptT $ maybe (pure ()) (void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal)) fnCode
   case res of
     Left e -> sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
     _ -> pure ()
@@ -89,11 +98,26 @@ appExprSimplFX f x = do
 
 sepBy2 parser delim = (:) <$> (parser <* delim) <*> sepBy1 parser delim
 
-varNameParser = (:) <$> letter <*> many alphaNum
+keywords = ["if","then","else"]
+
+varNameParser = do
+  v <- (:) <$> letter <*> many alphaNum
+  if v `elem` keywords then fail "Invalid variable name" else pure v
+
+ifParser :: (MonadProc m) => Parser (Code m -> Expr m)
+ifParser = f <$> g "if" <*> g "then" <*> (string "else" >> spaces >> exprParser) where
+  g s = string s >> spaces >> parenParser <* spaces
+  f :: (MonadProc m) => (Code m -> Expr m) -> (Code m -> Expr m) -> (Code m -> Expr m) -> (Code m -> Expr m)
+  f a b c v = ReducibleExpr $ do
+    a' <- simplExpr (a v)
+    case a' of
+      (BoolVal True) -> pure (b v)
+      (BoolVal False) -> pure (c v)
+      _ -> botError "Expected boolean"
 
 varParser :: (MonadProc m) => Parser (Code m -> Expr m)
 varParser = f <$> varNameParser where
-  f varName vars = case (M.lookup (pack varName) vars) of
+  f varName vars = case M.lookup (pack varName) vars of
     Nothing -> ReducibleExpr (botError ("Undefined variable " <> varName))
     Just x -> x
 
@@ -108,7 +132,7 @@ voidParser = char '(' >> space >> char ')' >> pure (const (ValueExpr VoidVal))
 
 tupParser :: (MonadProc m) => Parser (Code m -> Expr m)
 tupParser = f <$> (char '(' >> exprParser <* spaces <* char ',') <*> (spaces >> exprParser <* char ')') where
-  f a b vars = ReducibleExpr $ ValueExpr <$> (TupVal <$> (simplExpr $ a vars) <*> (simplExpr $ b vars))
+  f a b vars = ReducibleExpr $ ValueExpr <$> (TupVal <$> simplExpr (a vars) <*> simplExpr (b vars))
 
 parenParser :: (MonadProc m) => Parser (Code m -> Expr m)
 parenParser = char '(' >> exprParser <* char ')'
@@ -119,7 +143,7 @@ lamParser = f <$> (char '\\' >> varNameParser) <*> (spaces >> exprParser) where
   f var expr vars = ValueExpr $ FnVal (\val -> pure $ expr (M.insert (pack var) (ValueExpr val) vars))
 
 binOpParser :: (MonadProc m) => Parser (Code m -> Expr m)
-binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* spaces) <*> (try exprParser) where
+binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* spaces) <*> try exprParser where
   f a o b vars = ReducibleExpr $ do
     a' <- simplExpr $ a vars
     b' <- simplExpr $ b vars
@@ -133,20 +157,20 @@ binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* 
   _fold f (a:r) = f a (_fold f r)
 
 appParser :: (MonadProc m) => Parser (Code m -> Expr m)
-appParser = f <$> (sepBy2 subAppParser spaces) where
+appParser = f <$> sepBy2 subAppParser spaces where
   f [a,b] vars = ReducibleExpr $ appExprSimplFX (a vars) (b vars)
-  f (a:b:r) vars = f ((f [a,b]):r) vars
+  f (a:b:r) vars = f (f [a,b]:r) vars
 
 subAppParser :: (MonadProc m) => Parser (Code m -> Expr m)
 subAppParser = varParser <|> intParser <|> textParser <|> try tupParser <|> parenParser
 
 exprParser :: (MonadProc m) => Parser (Code m -> Expr m)
-exprParser = lamParser <|> try binOpParser <|> try appParser <|> subAppParser
+exprParser = lamParser <|> try ifParser <|> try binOpParser <|> try appParser <|> subAppParser
 
 fnParser :: (MonadProc m) => Parser (Text, Code m -> Expr m)
 fnParser = (,) <$> (pack <$> varNameParser) <*> (spaces >> char '=' >> spaces >> exprParser <* char ';')
 
-trySepBy p delim = try ((:) <$> (p <* delim) <*> trySepBy p delim) <|> (pure [])
+trySepBy p delim = try ((:) <$> (p <* delim) <*> trySepBy p delim) <|> pure []
 
 codeParser :: (MonadProc m) => Parser (Code m)
 codeParser = f . M.fromList . ((fmap const <$> codeDefaults) ++) <$> trySepBy (try fnParser) spaces where
@@ -167,10 +191,10 @@ otherOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
 otherOps = [("+",addOp),(">>",bindOp),("&",andOp),("|",orOp),("==",eqOp)]
 
 numOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-numOps = fmap numOp <$> [("*",(*)),("/",div),("%",mod),("^",(^))]
+numOps = fmap numOp <$> [("-",(-)),("*",(*)),("/",div),("%",mod),("^",(^))]
 
 numBoolOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-numBoolOps = fmap numBoolOp <$> [(">",(>)),("<",(<)),(">=",(>=)),("<=",(<=))]
+numBoolOps = fmap numBoolOp <$> [(">=",(>=)),("<=",(<=)),(">",(>)),("<",(<))]
 
 numOp op (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a `op` b
 numOp _ _ _ = botError "Expected number"
@@ -182,7 +206,7 @@ addOp (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a + b
 addOp (TextVal a) (TextVal b) = pure . ValueExpr . TextVal $ a <> b
 addOp _ _ = botError "Expected number or string"
 
-bindOp (IOVal a) b = pure . ValueExpr . IOVal $ a >>= appExprSimplX b
+bindOp (IOVal a) b = pure . ValueExpr . IOVal $ a >>= appExprSimplX b >>= runExpr
 bindOp _ _ = botError "Expected IO and function"
 
 andOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a && b
@@ -201,18 +225,41 @@ codeDefaults :: (MonadProc m) => [(Text, Expr m)]
 codeDefaults = [
     ("false", ValueExpr . BoolVal $ False),
     ("true",  ValueExpr . BoolVal $ True),
+    ("substr", threeArityHelper substrFn),
+    ("len", oneArityHelper lenFn),
     ("log", oneArityHelper logFn),
-    ("sendMsg", twoArityHelper sendFn)
+    ("sendMsg", twoArityHelper sendFn),
+    ("delayMicroS", oneArityHelper delayMicroSFn),
+    ("delayMs", oneArityHelper delayMsFn),
+    ("delaySec", oneArityHelper delaySecFn),
+    ("getGas", ValueExpr . IOVal $ fmap (ValueExpr . IntVal) getGas),
+    ("pass", ValueExpr . IOVal . pure $ ValueExpr VoidVal)
   ]
 
 oneArityHelper f = ValueExpr (FnVal f)
 twoArityHelper f = ValueExpr (FnVal $ pure . oneArityHelper . f)
+threeArityHelper f = ValueExpr (FnVal $ pure . twoArityHelper . f)
+
+substrFn (IntVal a) (IntVal b) (TextVal t) = pure . ValueExpr . TextVal . T.take (b - a) $ T.drop a t
+substrFn _ _ _ = botError "Expected int, int, and string"
+
+lenFn (TextVal t) = pure . ValueExpr . IntVal $ T.length t
+lenFn _ = botError "Expected string"
 
 logFn (TextVal t) = pure . ValueExpr . IOVal $ (liftIO . putStrLn $ unpack t) >> pure (ValueExpr VoidVal)
 logFn _ = botError "Expected string"
 
-sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ (liftDiscord $ sendMsg (fromIntegral c) t) >> pure (ValueExpr VoidVal)
+sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ liftDiscord (sendMsg (fromIntegral c) t) >> liftIO (threadDelay 500000) >> pure (ValueExpr VoidVal)
 sendFn _ _ = botError "Expected channel ID and string"
+
+delayMicroSFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay x) >> pure (ValueExpr VoidVal)
+delayMicroSFn _ = botError "Expected int"
+
+delayMsFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay (x * 1000)) >> pure (ValueExpr VoidVal)
+delayMsFn _ = botError "Expected int"
+
+delaySecFn (IntVal x) = pure . ValueExpr . IOVal $ liftIO (threadDelay (x * 1000000)) >> pure (ValueExpr VoidVal)
+delaySecFn _ = botError "Expected int"
 
 sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
 sendMsgM m = sendMsg (messageChannelId m)
@@ -228,8 +275,8 @@ addBot c = do
   return pid
 
 -- TODO permissions system
-msgContentHandler s m | isPrefixOf "_addProc " (messageContent m) = do
-  case (parseCode (drop (length ("_addProc " :: String)) (messageContent m))) of
+msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
+  case parseCode (T.drop (length ("_addProc " :: String)) (messageContent m)) of
     Left e -> sendMsgM m $ pack $ "Parse error: " <> show e
     Right c -> do
       pid <- liftIO . atomically . stateTVar s . runState $ addBot c
@@ -243,13 +290,14 @@ msgContentHandler s m = do
   pure ()
 
 eventHandler s (MessageCreate m) | not (userIsBot (messageAuthor m)) = msgContentHandler s m
+eventHandler s (Ready {}) = liftIO $ putStrLn "Bot is online"
 eventHandler _ _ = pure ()
 
 main = do
   tok <- getEnv "token"
-  state <- atomically $ newTVar (def :: LamBotState ProcMonad)
+  state <- newTVarIO (def :: LamBotState ProcMonad)
   otp <- runDiscord $ def {
-    discordToken = ("Bot " <> pack tok),
-    discordOnEvent = (eventHandler state)
+    discordToken = "Bot " <> pack tok,
+    discordOnEvent = eventHandler state
   }
   putStrLn $ unpack otp
