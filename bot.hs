@@ -2,7 +2,7 @@
 
 import System.Environment (getEnv)
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO, stateTVar, atomically)
+import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO, modifyTVar', stateTVar, atomically)
 import Control.Monad ((>=>), void, when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Reader (ask, local, reader, MonadReader)
@@ -14,12 +14,13 @@ import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 import Control.Monad.Trans.State (StateT, evalStateT)
 import Data.Default.Class (Default, def)
 import Data.Either.Combinators (whenLeft)
-import Data.Maybe (maybe)
+import Data.Maybe (maybe, isNothing)
 import Data.Text (Text, pack, unpack, isPrefixOf)
 import Discord (DiscordHandler, discordToken, discordOnEvent, runDiscord, restCall)
 import Discord.Types (ChannelId, Event(MessageCreate, Ready), Message, messageChannelId, messageContent, messageAuthor, userIsBot, userId)
 import Text.Parsec hiding (State)
 import Text.Parsec.Text (Parser)
+import Text.Read (readMaybe)
 import qualified Control.Concurrent.Event as Ev
 import qualified Control.Exception as E
 import qualified Data.Map as M
@@ -36,6 +37,7 @@ import qualified Discord.Requests as R
 -- TODO eventually write bots to a file in order to not have to keep them in memory
 
 startGas = 10000
+refuelGas = startGas
 gasPushThresh = 2000
 sendFnGas = 200
 sendFnPause = 500000
@@ -340,6 +342,13 @@ msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = flip whenLef
     getCode pid = do
       thisProc <- liftIO $ M.lookup pid . procList <$> readTVarIO s
       maybe (except (Left pid)) (liftIO . fmap procCode . readTVarIO) thisProc
+msgContentHandler s m | "_refuel " `isPrefixOf` messageContent m = flip when (sendMsgM m "Couldn't find a process with that PID") . isNothing =<< runMaybeT (do
+  -- TODO use hoistMaybe instead of MaybeT . pure; I can't get the import to work
+  pid <- MaybeT . pure . readMaybe . unpack $ T.drop (length ("_refuel " :: String)) (messageContent m)
+  procState <- MaybeT . liftIO $ M.lookup pid . procList <$> readTVarIO s
+  liftIO . atomically $ modifyTVar' procState (\sv -> sv { gasLeft = refuelGas })
+  liftIO $ (procUpdated <$> readTVarIO procState) >>= Ev.signal
+  lift . sendMsgM m . pack $ "Refueled process " <> show pid <> "'s gas to " <> show refuelGas)
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO $ M.keys . procList <$> readTVarIO s
