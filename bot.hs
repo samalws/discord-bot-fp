@@ -1,24 +1,24 @@
 {-# LANGUAGE OverloadedStrings, FlexibleInstances, DeriveFunctor, MultiParamTypeClasses #-}
 
 import System.Environment (getEnv)
-import Control.Concurrent
-import Control.Concurrent.STM
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO, stateTVar, atomically)
 import Control.Monad ((>=>), void, when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Reader (ask, local, reader, MonadReader)
 import Control.Monad.State (get, gets, put, modify, State, runState, MonadState)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except
+import Control.Monad.Trans.Except (ExceptT, runExceptT, except)
 import Control.Monad.Trans.Maybe (MaybeT(..), runMaybeT)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 import Control.Monad.Trans.State (StateT, evalStateT)
-import Data.Default.Class (Default)
+import Data.Default.Class (Default, def)
 import Data.Maybe (maybe)
 import Data.Text (Text, pack, unpack, isPrefixOf)
-import Discord
-import Discord.Types
+import Discord (DiscordHandler, discordToken, discordOnEvent, runDiscord, restCall)
+import Discord.Types (ChannelId, Event(MessageCreate, Ready), Message, messageChannelId, messageContent, messageAuthor, userIsBot, userId)
 import Text.Parsec hiding (State)
-import Text.Parsec.Text
+import Text.Parsec.Text (Parser)
 import qualified Control.Concurrent.Event as Ev
 import qualified Control.Exception as E
 import qualified Data.Map as M
@@ -36,6 +36,10 @@ import qualified Discord.Requests as R
 -- TODO gather all the constants towards the top of the file
 
 startGas = 10000
+gasPushThresh = 2000
+sendFnGas = 200
+sendFnPause = 500000
+binOpGas = 1
 
 type Gas = Int
 type PID = Int
@@ -86,7 +90,7 @@ instance MonadProc ProcMonad where
   payGas n = do
     modify $ fmap (+ n)
     g <- gets snd
-    when (g > 2000) pushChanges
+    when (g > gasPushThresh) pushChanges
   getGas = gets f where f (a,b) = gasLeft a - b
   pushChanges = do
     tv <- reader fst
@@ -199,7 +203,7 @@ binOpParser = f <$> (try appParser <|> subAppParser) <*> (spaces >> opParser <* 
   f a o b vars = ReducibleExpr $ do
     a' <- descendStmt . simplExpr $ a vars
     b' <- descendStmt . simplExpr $ b vars
-    payGas 1
+    payGas binOpGas
     o a' b'
 
   opParser :: (MonadProc m) => Parser (Value m -> Value m -> m (Expr m))
@@ -308,7 +312,7 @@ substrFn _ _ _ = botError "Expected int, int, and string"
 lenFn (TextVal t) = pure . ValueExpr . IntVal $ T.length t
 lenFn _ = botError "Expected string"
 
-sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ payGas 100 >> pushChanges >> liftDiscord (sendMsg (fromIntegral c) t) >> liftIO (threadDelay 500000) >> pure (ValueExpr VoidVal)
+sendFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ payGas sendFnGas >> pushChanges >> liftDiscord (sendMsg (fromIntegral c) t) >> liftIO (threadDelay sendFnPause) >> pure (ValueExpr VoidVal)
 sendFn _ _ = botError "Expected channel ID and string"
 
 delayFn mul (IntVal x) = pure . ValueExpr . IOVal $ payGas 5 >> pushChanges >> liftIO (threadDelay (mul * x)) >> pure (ValueExpr VoidVal)
@@ -363,7 +367,7 @@ msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
       maybe (except (Left pid)) (liftIO . fmap procCode . readTVarIO) thisProc
 msgContentHandler s m = do
   r <- ask
-  ks <- liftIO . atomically $ M.keys . procList <$> readTVar s
+  ks <- liftIO $ M.keys . procList <$> readTVarIO s
   void . liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
 
 eventHandler :: TVar (LamBotState ProcMonad) -> Event -> DiscordHandler ()
