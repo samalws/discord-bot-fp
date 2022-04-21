@@ -18,6 +18,7 @@ import Discord
 import Discord.Types
 import Text.Parsec hiding (State)
 import Text.Parsec.Text
+import qualified Control.Concurrent.Event as Ev
 import qualified Control.Exception as E
 import qualified Data.Map as M
 import qualified Data.Set as S
@@ -33,15 +34,14 @@ import qualified Discord.Requests as R
 -- TODO eventually write bots to a file in order to not have to keep them in memory
 -- TODO gather all the constants towards the top of the file
 
+startGas = 10000
+
 type Gas = Int
 type PID = Int
 data ProcAllowance = Allowed | AllowedNoPrefix deriving Eq
-data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance, gasLeft :: Int }
+data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance, gasLeft :: Gas, procUpdated :: Ev.Event }
 data LamBotState m = LamBotState { procList :: M.Map PID (TVar (ProcState m)), procsAllowed :: M.Map ChannelId (M.Map PID ProcAllowance), maxPID :: Int }
 -- TODO procList should be a map to pointers not actual values
-
-instance Default (ProcState m) where
-  def = ProcState { procCode = M.empty, procVars = M.empty, channelsAllowed = M.empty, gasLeft = 0 }
 
 instance Default (LamBotState m) where
   def = LamBotState { procList = M.empty, procsAllowed = M.empty, maxPID = -1 }
@@ -60,7 +60,7 @@ class (MonadIO m) => MonadProc m where
   liftDiscord :: DiscordHandler a -> m a
   botError :: String -> m a
 
-newtype ProcMonad a = ProcMonad { runProcMonad :: ExceptT String (ReaderT (TVar (ProcState ProcMonad),Int) (StateT (ProcState ProcMonad, Int) DiscordHandler)) a } deriving (Functor)
+newtype ProcMonad a = ProcMonad { runProcMonad :: ExceptT String (ReaderT (TVar (ProcState ProcMonad),Int) (StateT (ProcState ProcMonad, Gas) DiscordHandler)) a } deriving (Functor)
 -- TODO maybe use GeneralizedNewtypeDeriving
 
 instance Applicative ProcMonad where
@@ -80,25 +80,32 @@ instance MonadState (ProcState ProcMonad, Int) ProcMonad where
 instance MonadReader (TVar (ProcState ProcMonad),Int) ProcMonad where
   ask = ProcMonad ask
   local f x = ProcMonad $ local f (runProcMonad x)
-  
 
 instance MonadProc ProcMonad where
   payGas n = do
     modify $ fmap (+ n)
     g <- gets snd
     if (g > 2000) then pushChanges else pure ()
-  getGas = gets snd -- gets f where f (a,b) = gasLeft a - b
+  getGas = gets f where f (a,b) = gasLeft a - b
   pushChanges = do
     tv <- reader fst
     (state,gasUsed) <- get
     newGas <- liftIO . atomically . stateTVar tv $ (\s -> let g' = gasLeft s - gasUsed in (g', s { gasLeft = g' }))
+    liftIO . Ev.signal $ procUpdated state
     newChannels <- liftIO $ channelsAllowed <$> readTVarIO tv
     let state' = state { channelsAllowed = newChannels, gasLeft = newGas }
-    put (state, 0) -- TODO halt if out of gas
+    put (state', 0)
+    if newGas <= 0 then waitForGas else pure ()
   descendStmt = local $ fmap (+1)
   getDepth = reader snd
   liftDiscord = ProcMonad . lift . lift . lift
   botError s = pushChanges >> ProcMonad (except (Left s))
+
+waitForGas :: ProcMonad ()
+waitForGas = do
+  ev <- gets (procUpdated . fst)
+  liftIO $ Ev.wait ev
+  pushChanges
 
 simplExpr :: (MonadProc m) => Expr m -> m (Value m)
 simplExpr (ValueExpr x) = pure x
@@ -314,7 +321,9 @@ sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
 sendMsgM m = sendMsg (messageChannelId m)
 
 newBotState :: Code m -> IO (TVar (ProcState m))
-newBotState c = newTVarIO $ def { procCode = c }
+newBotState c = do
+  ev <- Ev.new
+  newTVarIO $ ProcState { procCode = c, procVars = M.empty, channelsAllowed = M.empty, gasLeft = startGas, procUpdated = ev }
 
 addBot :: (TVar (ProcState m)) -> LamBotState m -> (PID, LamBotState m)
 addBot c s = let pid = maxPID s + 1 in (pid, s { procList = M.insert pid c (procList s), maxPID = pid })
