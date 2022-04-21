@@ -16,8 +16,10 @@ import Data.Default.Class (Default, def)
 import Data.Either.Combinators (whenLeft)
 import Data.Maybe (maybe, isNothing, isJust)
 import Data.Text (Text, pack, unpack, isPrefixOf)
+import Data.UnixTime (getUnixTime, utSeconds)
 import Discord (DiscordHandler, discordToken, discordOnEvent, runDiscord, restCall)
 import Discord.Types (ChannelId, Event(MessageCreate, Ready), Message, messageChannelId, messageContent, messageAuthor, userIsBot, userId)
+import System.Random (randomIO)
 import Text.Parsec hiding (State)
 import Text.Parsec.Text (Parser)
 import Text.Read (readMaybe)
@@ -30,16 +32,19 @@ import qualified Discord.Requests as R
 
 -- TODO parse comments, make it so you dont need parens for if or binary operations, make it so typing negative integers (eg -5) works(?)
 -- TODO add floats?
--- TODO writing to state variables, @ people, get time, RNG
+-- TODO writing to state variables, @ people, emoji
 -- TODO remove unused imports (how?)
 -- TODO eventually write bots to a file in order to not have to keep them in memory
 -- TODO add allowedList command; make a map from channel to allowed PIDs
 -- TODO add short circuiting and then maybe also add a bind operator that ignores the result
+-- TODO make a maximum string size
 
 startGas = 100000
 refuelGas = startGas
 gasPushThresh = 2000
 sendFnGas = 1000
+randomFnGas = 100
+getUnixTimeFnGas = 100
 sendFnPause = 500000
 binOpGas = 1
 
@@ -290,6 +295,8 @@ codeDefaults = [
     ("delayMs", oneArityHelper (delayFn 1000)),
     ("delaySec", oneArityHelper (delayFn 1000000)),
     ("getGas", ValueExpr . IOVal $ payGas 1 >> fmap (ValueExpr . IntVal) getGas),
+    ("random", ValueExpr . IOVal $ payGas randomFnGas >> fmap (ValueExpr . IntVal) (liftIO randomIO)),
+    ("getUnixTime", ValueExpr . IOVal $ payGas getUnixTimeFnGas >> fmap (ValueExpr . IntVal . fromEnum . utSeconds) (liftIO getUnixTime)),
     ("pass", ValueExpr . IOVal . pure $ ValueExpr VoidVal)
   ] -- TODO getPID, getAllowed
 
