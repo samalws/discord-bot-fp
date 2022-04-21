@@ -8,11 +8,12 @@ import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Reader (ask, local, reader, MonadReader)
 import Control.Monad.State (get, gets, put, modify, State, runState, MonadState)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except (ExceptT, runExceptT, except)
+import Control.Monad.Trans.Except (ExceptT, runExceptT, except, withExceptT)
 import Control.Monad.Trans.Maybe (MaybeT(..), runMaybeT)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 import Control.Monad.Trans.State (StateT, evalStateT)
 import Data.Default.Class (Default, def)
+import Data.Either.Combinators (whenLeft)
 import Data.Maybe (maybe)
 import Data.Text (Text, pack, unpack, isPrefixOf)
 import Discord (DiscordHandler, discordToken, discordOnEvent, runDiscord, restCall)
@@ -327,18 +328,13 @@ addStdLib fname state = do
 
 -- TODO permissions system
 msgContentHandler :: TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
-msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
-  case parseCode getCode (T.drop (length ("_addProc " :: String)) (messageContent m)) of
-    Left e -> sendMsgM m $ pack $ "Parse error: " <> show e
-    Right c -> do
-      c' <- runExceptT c
-      case c' of
-        Left pid -> sendMsgM m . pack $ "Couldn't find process with PID " <> show pid
-        Right code -> do
-          pid <- liftIO $ addBotIO code s
-          sendMsgM m $ pack $ "Created process with ID " <> show pid
-          -- TODO enable bot in this channel
-          runCode s m pid "start"
+msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = flip whenLeft (sendMsgM m . pack) =<< runExceptT (do
+  c <- withExceptT (("Parse error: " <>) . show) . except $ parseCode getCode (T.drop (length ("_addProc " :: String)) (messageContent m))
+  code <- withExceptT (("Couldn't find process with PID " <>) . show) c
+  pid <- liftIO $ addBotIO code s
+  lift . sendMsgM m . pack $ "Created process with ID " <> show pid
+  -- TODO enable bot in this channel
+  lift $ runCode s m pid "start")
   where
     getCode :: PID -> ExceptT PID DiscordHandler (Code ProcMonad)
     getCode pid = do
