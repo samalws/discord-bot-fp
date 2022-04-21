@@ -26,11 +26,11 @@ import qualified Discord.Requests as R
 
 -- TODO parse comments
 -- TODO make it so you dont need parens for if or binary operations
--- TODO import other procs; do standard library by having "import 0"
 -- TODO make it so typing negative integers (eg -5) works(?)
 -- TODO add floats?
 -- TODO writing to state variables, @ people, get time, RNG
 -- TODO remove unused imports (how?)
+-- TODO eventually write bots to a file in order to not have to keep them in memory
 
 type Gas = Int
 type PID = Int
@@ -43,7 +43,7 @@ instance Default (ProcState m) where
   def = ProcState { procCode = M.empty, procVars = M.empty, channelsAllowed = M.empty }
 
 instance Default (LamBotState m) where
-  def = LamBotState { procList = M.empty, procsAllowed = M.empty, maxPID = 0 }
+  def = LamBotState { procList = M.empty, procsAllowed = M.empty, maxPID = -1 }
 
 type Code m = M.Map Text (Expr m)
 data Expr m = ValueExpr (Value m) | ReducibleExpr (m (Expr m))
@@ -109,12 +109,14 @@ appExprSimplFX f x = do
 
 sepBy2 parser delim = (:) <$> (parser <* delim) <*> sepBy1 parser delim
 
-keywords = ["if","then","else"]
+keywords = ["import","if","then","else"]
 
+-- TODO also allow minus signs
 varNameParser = do
-  v <- (:) <$> letter <*> many alphaNum
+  v <- (:) <$> (letter <|> char '_') <*> many (alphaNum <|> char '_')
   if v `elem` keywords then fail "Invalid variable name" else pure v
 
+-- TODO prob add space >> spaces rather than spaces in some of these
 ifParser :: (MonadProc m) => Parser (Code m -> Expr m)
 ifParser = f <$> g "if" <*> g "then" <*> (string "else" >> spaces >> exprParser) where
   g s = string s >> spaces >> parenParser <* spaces
@@ -181,18 +183,29 @@ exprParser = lamParser <|> try ifParser <|> try binOpParser <|> try appParser <|
 fnParser :: (MonadProc m) => Parser (Text, Code m -> Expr m)
 fnParser = (,) <$> (pack <$> varNameParser) <*> (spaces >> char '=' >> spaces >> exprParser <* char ';')
 
+importParser :: Parser PID
+importParser = string "import" >> space >> spaces >> (read <$> many1 digit) <* spaces <* char ';'
+
+fnParser' :: (MonadProc mp, Monad mi) => Parser (mi [(Text, Code mp -> Expr mp)])
+fnParser' = pure . (:[]) <$> fnParser
+
+importParser' :: (MonadProc mp, Monad mi) => (PID -> mi (Code mp)) -> Parser (mi [(Text, Code mp -> Expr mp)])
+importParser' grabCode = f <$> importParser where
+  f pid = g <$> grabCode pid
+  g code = fmap const <$> M.toList code
+
 trySepBy p delim = try ((:) <$> (p <* delim) <*> trySepBy p delim) <|> pure []
 
-codeParser :: (MonadProc m) => Parser (Code m)
-codeParser = f . M.fromList . ((fmap const <$> codeDefaults) ++) <$> trySepBy (try fnParser) spaces where
-  f :: M.Map Text (Code m -> Expr m) -> M.Map Text (Expr m)
+codeParser :: (MonadProc mp, Monad mi) => (PID -> mi (Code mp)) -> Parser (mi (Code mp))
+codeParser grabCode = fmap (f . M.fromList . ((fmap const <$> codeDefaults) ++) . concat) . sequence <$> trySepBy (try fnParser' <|> try (importParser' grabCode)) spaces where
+  f :: M.Map Text (Code mp -> Expr mp) -> M.Map Text (Expr mp)
   f code = let code' = ($ code') <$> code in code'
 
-codeFileParser :: (MonadProc m) => Parser (Code m)
-codeFileParser = spaces >> optional (string "```") >> spaces >> codeParser <* spaces <* optional (string "```") <* spaces <* eof
+codeFileParser :: (MonadProc mp, Monad mi) => (PID -> mi (Code mp)) -> Parser (mi (Code mp))
+codeFileParser grabCode = spaces >> optional (string "```") >> spaces >> codeParser grabCode <* spaces <* optional (string "```") <* spaces <* eof
 
-parseCode :: (MonadProc m) => Text -> Either ParseError (Code m)
-parseCode = parse codeFileParser "Inputted function"
+parseCode :: (MonadProc mp, Monad mi) => (PID -> mi (Code mp)) -> Text -> Either ParseError (mi (Code mp))
+parseCode grabCode = parse (codeFileParser grabCode) "Inputted function"
 
 
 ops :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
@@ -262,6 +275,7 @@ sendFn _ _ = botError "Expected channel ID and string"
 delayFn mul (IntVal x) = pure . ValueExpr . IOVal $ payGas 5 >> pushChanges >> liftIO (threadDelay (mul * x)) >> pure (ValueExpr VoidVal)
 delayFn _ _ = botError "Expected int"
 
+
 sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
 sendMsgM m = sendMsg (messageChannelId m)
 
@@ -275,21 +289,44 @@ addBot c = do
   }
   return pid
 
+
+addStdLib :: String -> TVar (LamBotState ProcMonad) -> IO ()
+addStdLib fname state = do
+  fileText <- pack <$> readFile fname
+  case parseCode (const $ error "stdlib tried to import") fileText of
+    Left e -> error $ "Parse error: " <> show e
+    Right c -> do
+      c' <- c
+      pid <- atomically . stateTVar state . runState $ addBot c'
+      putStrLn $ "Added stlib with pid " <> show pid
+
+
 -- TODO permissions system
+msgContentHandler :: TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
 msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
-  case parseCode (T.drop (length ("_addProc " :: String)) (messageContent m)) of
+  case parseCode getCode (T.drop (length ("_addProc " :: String)) (messageContent m)) of
     Left e -> sendMsgM m $ pack $ "Parse error: " <> show e
     Right c -> do
-      pid <- liftIO . atomically . stateTVar s . runState $ addBot c
-      sendMsgM m $ pack $ "Created process with ID " <> show pid
-      -- TODO enable bot in this channel
-      runCode s m pid "start"
+      c' <- runExceptT c
+      case c' of
+        Left pid -> sendMsgM m . pack $ "Couldn't find process with PID " <> show pid
+        Right code -> do
+          pid <- liftIO . atomically . stateTVar s . runState $ addBot code
+          sendMsgM m $ pack $ "Created process with ID " <> show pid
+          -- TODO enable bot in this channel
+          runCode s m pid "start"
+  where
+    getCode :: PID -> ExceptT PID DiscordHandler (Code ProcMonad)
+    getCode pid = do
+      thisProc <- liftIO $ atomically $ M.lookup pid . procList <$> readTVar s
+      maybe (except (Left pid)) (pure . procCode) thisProc
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO . atomically $ M.keys . procList <$> readTVar s
   liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
   pure ()
 
+eventHandler :: TVar (LamBotState ProcMonad) -> Event -> DiscordHandler ()
 eventHandler s (MessageCreate m) | not (userIsBot (messageAuthor m)) = msgContentHandler s m
 eventHandler s (Ready {}) = liftIO $ putStrLn "Bot is online"
 eventHandler _ _ = pure ()
@@ -297,6 +334,7 @@ eventHandler _ _ = pure ()
 main = do
   tok <- getEnv "token"
   state <- newTVarIO (def :: LamBotState ProcMonad)
+  addStdLib "stdLib" state
   otp <- runDiscord $ def {
     discordToken = "Bot " <> pack tok,
     discordOnEvent = eventHandler state
