@@ -3,12 +3,13 @@
 import System.Environment (getEnv)
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Monad ((>=>), void)
+import Control.Monad ((>=>), void, when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Reader (ask, local, reader, MonadReader)
 import Control.Monad.State (get, gets, put, modify, State, runState, MonadState)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except
+import Control.Monad.Trans.Maybe (MaybeT(..), runMaybeT)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
 import Control.Monad.Trans.State (StateT, evalStateT)
 import Data.Default.Class (Default)
@@ -85,7 +86,7 @@ instance MonadProc ProcMonad where
   payGas n = do
     modify $ fmap (+ n)
     g <- gets snd
-    if (g > 2000) then pushChanges else pure ()
+    when (g > 2000) pushChanges
   getGas = gets f where f (a,b) = gasLeft a - b
   pushChanges = do
     tv <- reader fst
@@ -95,7 +96,7 @@ instance MonadProc ProcMonad where
     newChannels <- liftIO $ channelsAllowed <$> readTVarIO tv
     let state' = state { channelsAllowed = newChannels, gasLeft = newGas }
     put (state', 0)
-    if newGas <= 0 then waitForGas else pure ()
+    when (newGas <= 0) waitForGas
   descendStmt = local $ fmap (+1)
   getDepth = reader snd
   liftDiscord = ProcMonad . lift . lift . lift
@@ -119,20 +120,17 @@ runExpr e = do
     _ -> botError "Expected IO"
 
 runCode :: TVar (LamBotState ProcMonad) -> Message -> PID -> Text -> DiscordHandler ()
-runCode s msg pid fn = do
-  fnState_ <- liftIO $ (M.lookup pid . procList) <$> readTVarIO s
-  fnCode_ <- maybe (pure Nothing) (liftIO . fmap (M.lookup fn . procCode) . readTVarIO) fnState_
-  case (fnState_,fnCode_) of
-    (Just fnState, Just fnCode) -> do
-      let channelVal = IntVal . fromIntegral $ messageChannelId msg
-      let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
-      let contentVal = TextVal $ messageContent msg
-      let call a b = ReducibleExpr (appExprSimplF a b)
-      stateVal <- liftIO $ readTVarIO fnState
-      res <- flip evalStateT (stateVal,0) . flip runReaderT (fnState,0) . runExceptT . runProcMonad . void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal) $ fnCode
-      case res of
-        Left e -> sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
-        _ -> pure ()
+runCode s msg pid fn = void . runMaybeT $ do
+  fnState <- MaybeT . liftIO $ M.lookup pid . procList <$> readTVarIO s
+  fnCode  <- MaybeT . liftIO $ M.lookup fn  . procCode <$> readTVarIO fnState
+  let channelVal = IntVal . fromIntegral $ messageChannelId msg
+  let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
+  let contentVal = TextVal $ messageContent msg
+  let call a b = ReducibleExpr (appExprSimplF a b)
+  stateVal <- liftIO $ readTVarIO fnState
+  res <- lift . flip evalStateT (stateVal,0) . flip runReaderT (fnState,0) . runExceptT . runProcMonad . void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal) $ fnCode
+  case res of
+    Left e -> lift $ sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
     _ -> pure ()
 
 appExpr (FnVal f) x = getDepth >>= payGas >> f x
@@ -317,7 +315,7 @@ delayFn mul (IntVal x) = pure . ValueExpr . IOVal $ payGas 5 >> pushChanges >> l
 delayFn _ _ = botError "Expected int"
 
 
-sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
+sendMsg c msg = void . restCall $ R.CreateMessage c msg
 sendMsgM m = sendMsg (messageChannelId m)
 
 newBotState :: Code m -> IO (TVar (ProcState m))
@@ -325,10 +323,10 @@ newBotState c = do
   ev <- Ev.new
   newTVarIO $ ProcState { procCode = c, procVars = M.empty, channelsAllowed = M.empty, gasLeft = startGas, procUpdated = ev }
 
-addBot :: (TVar (ProcState m)) -> LamBotState m -> (PID, LamBotState m)
+addBot :: TVar (ProcState m) -> LamBotState m -> (PID, LamBotState m)
 addBot c s = let pid = maxPID s + 1 in (pid, s { procList = M.insert pid c (procList s), maxPID = pid })
 
-addBotIO :: (Code m) -> TVar (LamBotState m) -> IO PID
+addBotIO :: Code m -> TVar (LamBotState m) -> IO PID
 addBotIO c s = do
   botState <- newBotState c
   atomically . stateTVar s $ addBot botState
@@ -366,8 +364,7 @@ msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO . atomically $ M.keys . procList <$> readTVar s
-  liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
-  pure ()
+  void . liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
 
 eventHandler :: TVar (LamBotState ProcMonad) -> Event -> DiscordHandler ()
 eventHandler s (MessageCreate m) | not (userIsBot (messageAuthor m)) = msgContentHandler s m
