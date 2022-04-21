@@ -28,13 +28,12 @@ import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Discord.Requests as R
 
--- TODO parse comments
--- TODO make it so you dont need parens for if or binary operations
--- TODO make it so typing negative integers (eg -5) works(?)
+-- TODO parse comments, make it so you dont need parens for if or binary operations, make it so typing negative integers (eg -5) works(?)
 -- TODO add floats?
 -- TODO writing to state variables, @ people, get time, RNG
 -- TODO remove unused imports (how?)
 -- TODO eventually write bots to a file in order to not have to keep them in memory
+-- TODO add allowedList command; make a map from channel to allowed PIDs
 
 startGas = 10000
 refuelGas = startGas
@@ -318,15 +317,15 @@ delayFn _ _ = botError "Expected int"
 sendMsg c msg = void . restCall $ R.CreateMessage c msg
 sendMsgM m = sendMsg (messageChannelId m)
 
-newBotState :: Code m -> PID -> IO (TVar (ProcState m))
-newBotState c pid = do
+newBotState :: M.Map ChannelId ProcAllowance -> Code m -> PID -> IO (TVar (ProcState m))
+newBotState a c pid = do
   ev <- Ev.new
-  newTVarIO $ ProcState { procPID = pid, procCode = c, procVars = M.empty, channelsAllowed = M.empty, gasLeft = startGas, procUpdated = ev }
+  newTVarIO $ ProcState { procPID = pid, procCode = c, procVars = M.empty, channelsAllowed = a, gasLeft = startGas, procUpdated = ev }
 
-addBotIO :: Code m -> TVar (LamBotState m) -> IO PID
-addBotIO c s = do
+addBotIO :: M.Map ChannelId ProcAllowance -> Code m -> TVar (LamBotState m) -> IO PID
+addBotIO a c s = do
   pid <- atomically . stateTVar s $ (\st -> let pid = maxPID st + 1 in (pid, st { maxPID = pid }))
-  botState <- newBotState c pid
+  botState <- newBotState a c pid
   atomically . modifyTVar' s $ (\st -> st { procList = M.insert pid botState (procList st) })
   pure pid
 
@@ -337,16 +336,15 @@ addStdLib fname state = do
     Left e -> error $ "Parse error: " <> show e
     Right c -> do
       c' <- c
-      pid <- addBotIO c' state
+      pid <- addBotIO M.empty c' state
       putStrLn $ "Added stlib with pid " <> show pid
 
 
--- TODO get bot fuel; get bot allowed
 msgContentHandler :: TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
 msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = flip whenLeft (sendMsgM m . pack) =<< runExceptT (do
   c <- withExceptT (("Parse error: " <>) . show) . except $ parseCode getCode (T.drop (length ("_addProc " :: String)) (messageContent m))
   code <- withExceptT (("Couldn't find process with PID " <>) . show) c
-  pid <- liftIO $ addBotIO code s
+  pid <- liftIO $ addBotIO (M.singleton (messageChannelId m) Allowed) code s
   lift . sendMsgM m . pack $ "Created process with ID " <> show pid
   lift $ runCode s m pid "start")
   where
@@ -354,13 +352,18 @@ msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = flip whenLef
     getCode pid = do
       thisProc <- liftIO $ M.lookup pid . procList <$> readTVarIO s
       maybe (except (Left pid)) (liftIO . fmap procCode . readTVarIO) thisProc
-msgContentHandler s m | isModifyProcessCmd (messageContent m) = void . sequence $ runModifyProcessCmdFromList s m <$> modifyProcessCmds
+msgContentHandler s m | onCmdList (messageContent m) = void . sequence $ ($ m) . ($ s) . snd <$> cmdList
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO $ M.keys . procList <$> readTVarIO s
   void . liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
 
-isModifyProcessCmd s = any (`isPrefixOf` s) $ fst <$> modifyProcessCmds
+onCmdList s = any (`isPrefixOf` s) $ fst <$> cmdList
+
+cmdList :: [(Text, TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ())]
+cmdList = (f <$> modifyProcessCmds) <> (g <$> readProcessCmds) where
+  f (x,y) = (x, runModifyProcessCmdFromList (x,y))
+  g (x,y) = (x, runReadProcessCmdFromList (x,y))
 
 modifyProcessCmds :: [(Text, ((Message -> ProcState ProcMonad -> ProcState ProcMonad), (PID -> String), Text))]
 modifyProcessCmds = [
@@ -370,18 +373,37 @@ modifyProcessCmds = [
     ("_ban ", ((\m sv -> sv { channelsAllowed = M.delete (messageChannelId m) (channelsAllowed sv) }), (\pid -> "Banned process " <> show pid <> " from this channel"), "banned"))
   ]
 
-runModifyProcessCmdFromList s m (pre,(f,msgGen,fnCall)) = when (pre `isPrefixOf` messageContent m) (runModifyProcessCmd (T.length pre) f msgGen fnCall s m)
+readProcessCmds :: [(Text, Message -> ProcState ProcMonad -> String)]
+readProcessCmds = [
+    ("_gas ",(\_ sv -> "Process " <> show (procPID sv) <> " has " <> show (gasLeft sv) <> " gas")),
+    ("_allowed ",(\m sv -> "Process " <> show (procPID sv) <> genAllowedMsg (procPID sv) (M.lookup (messageChannelId m) (channelsAllowed sv))))
+  ]
+  where
+    genAllowedMsg _ Nothing = " is banned in this channel"
+    genAllowedMsg _ (Just Allowed) = " is allowed in this channel"
+    genAllowedMsg pid (Just AllowedNoPrefix) = " is allowed in this channel without the [" <> show pid <> "] prefix"
 
-runModifyProcessCmd :: Int -> (Message -> ProcState ProcMonad -> ProcState ProcMonad) -> (PID -> String) -> Text -> TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
-runModifyProcessCmd preLen f msgGen fnCall s m = flip when (sendMsgM m "Couldn't find a process with that PID") . isNothing =<< runMaybeT (do
+runModifyProcessCmdFromList (pre,(f,msgGen,fnCall)) s m = when (pre `isPrefixOf` messageContent m) (runModifyProcessCmd (T.length pre) f msgGen fnCall s m)
+
+runReadProcessCmdFromList (pre,f) s m = when (pre `isPrefixOf` messageContent m) (runReadProcessCmd (T.length pre) f s m)
+
+runCmd :: Int -> (TVar (ProcState ProcMonad) -> PID -> TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()) -> TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
+runCmd preLen f s m = flip when (sendMsgM m "Couldn't find a process with that PID") . isNothing =<< runMaybeT (do
   -- TODO use hoistMaybe instead of MaybeT . pure; I can't get the import to work
   pid <- MaybeT . pure . readMaybe . unpack $ T.drop preLen (messageContent m)
   procState <- MaybeT . liftIO $ M.lookup pid . procList <$> readTVarIO s
+  lift $ f procState pid s m)
+
+runModifyProcessCmd :: Int -> (Message -> ProcState ProcMonad -> ProcState ProcMonad) -> (PID -> String) -> Text -> TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
+runModifyProcessCmd preLen f msgGen fnCall = runCmd preLen $ (\procState pid s m -> do
   liftIO . atomically $ modifyTVar' procState (f m)
   liftIO $ (procUpdated <$> readTVarIO procState) >>= Ev.signal
-  lift . sendMsgM m . pack $ msgGen pid
-  r <- lift ask
+  sendMsgM m . pack $ msgGen pid
+  r <- ask
   void . liftIO . flip runReaderT r $ runCode s m pid fnCall)
+
+runReadProcessCmd :: Int -> (Message -> ProcState ProcMonad -> String) -> TVar (LamBotState ProcMonad) -> Message -> DiscordHandler ()
+runReadProcessCmd preLen f = runCmd preLen $ (\procState pid s m -> liftIO (f m <$> readTVarIO procState) >>= sendMsgM m . pack)
 
 eventHandler :: TVar (LamBotState ProcMonad) -> Event -> DiscordHandler ()
 eventHandler s (MessageCreate m) | not (userIsBot (messageAuthor m)) = msgContentHandler s m
