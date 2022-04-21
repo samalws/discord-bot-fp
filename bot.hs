@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, FlexibleInstances, DeriveFunctor, MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving #-}
 
 import System.Environment (getEnv)
 import Control.Concurrent (forkIO, threadDelay)
@@ -33,7 +33,6 @@ import qualified Discord.Requests as R
 -- TODO writing to state variables, @ people, get time, RNG
 -- TODO remove unused imports (how?)
 -- TODO eventually write bots to a file in order to not have to keep them in memory
--- TODO gather all the constants towards the top of the file
 
 startGas = 10000
 gasPushThresh = 2000
@@ -46,7 +45,6 @@ type PID = Int
 data ProcAllowance = Allowed | AllowedNoPrefix deriving Eq
 data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance, gasLeft :: Gas, procUpdated :: Ev.Event }
 data LamBotState m = LamBotState { procList :: M.Map PID (TVar (ProcState m)), procsAllowed :: M.Map ChannelId (M.Map PID ProcAllowance), maxPID :: Int }
--- TODO procList should be a map to pointers not actual values
 
 instance Default (LamBotState m) where
   def = LamBotState { procList = M.empty, procsAllowed = M.empty, maxPID = -1 }
@@ -65,26 +63,7 @@ class (MonadIO m) => MonadProc m where
   liftDiscord :: DiscordHandler a -> m a
   botError :: String -> m a
 
-newtype ProcMonad a = ProcMonad { runProcMonad :: ExceptT String (ReaderT (TVar (ProcState ProcMonad),Int) (StateT (ProcState ProcMonad, Gas) DiscordHandler)) a } deriving (Functor)
--- TODO maybe use GeneralizedNewtypeDeriving
-
-instance Applicative ProcMonad where
-  a <*> b = ProcMonad $ runProcMonad a <*> runProcMonad b
-  pure a = ProcMonad $ pure a
-
-instance Monad ProcMonad where
-  a >>= b = ProcMonad $ runProcMonad a >>= runProcMonad . b
-
-instance MonadIO ProcMonad where
-  liftIO a = ProcMonad $ liftIO a
-
-instance MonadState (ProcState ProcMonad, Int) ProcMonad where
-  get = ProcMonad get
-  put v = ProcMonad $ put v
-
-instance MonadReader (TVar (ProcState ProcMonad),Int) ProcMonad where
-  ask = ProcMonad ask
-  local f x = ProcMonad $ local f (runProcMonad x)
+newtype ProcMonad a = ProcMonad { runProcMonad :: ExceptT String (ReaderT (TVar (ProcState ProcMonad),Int) (StateT (ProcState ProcMonad, Gas) DiscordHandler)) a } deriving (Functor, Applicative, Monad, MonadIO, MonadState (ProcState ProcMonad, Int), MonadReader (TVar (ProcState ProcMonad), Int))
 
 instance MonadProc ProcMonad where
   payGas n = do
