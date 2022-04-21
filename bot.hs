@@ -1,12 +1,12 @@
-{-# LANGUAGE OverloadedStrings, FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings, FlexibleInstances, DeriveFunctor, MultiParamTypeClasses #-}
 
 import System.Environment (getEnv)
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad ((>=>), void)
 import Control.Monad.IO.Class (liftIO, MonadIO)
-import Control.Monad.Reader (ask, local)
-import Control.Monad.State (get, put, modify, State, runState)
+import Control.Monad.Reader (ask, local, reader, MonadReader)
+import Control.Monad.State (get, gets, put, modify, State, runState, MonadState)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.Reader (ReaderT, runReaderT)
@@ -31,16 +31,17 @@ import qualified Discord.Requests as R
 -- TODO writing to state variables, @ people, get time, RNG
 -- TODO remove unused imports (how?)
 -- TODO eventually write bots to a file in order to not have to keep them in memory
+-- TODO gather all the constants towards the top of the file
 
 type Gas = Int
 type PID = Int
 data ProcAllowance = Allowed | AllowedNoPrefix deriving Eq
-data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance }
-data LamBotState m = LamBotState { procList :: M.Map PID (ProcState m), procsAllowed :: M.Map ChannelId (M.Map PID ProcAllowance), maxPID :: Int }
+data ProcState m = ProcState { procCode :: Code m, procVars :: M.Map Text (TVar (Value m)), channelsAllowed :: M.Map ChannelId ProcAllowance, gasLeft :: Int }
+data LamBotState m = LamBotState { procList :: M.Map PID (TVar (ProcState m)), procsAllowed :: M.Map ChannelId (M.Map PID ProcAllowance), maxPID :: Int }
 -- TODO procList should be a map to pointers not actual values
 
 instance Default (ProcState m) where
-  def = ProcState { procCode = M.empty, procVars = M.empty, channelsAllowed = M.empty }
+  def = ProcState { procCode = M.empty, procVars = M.empty, channelsAllowed = M.empty, gasLeft = 0 }
 
 instance Default (LamBotState m) where
   def = LamBotState { procList = M.empty, procsAllowed = M.empty, maxPID = -1 }
@@ -49,8 +50,6 @@ type Code m = M.Map Text (Expr m)
 data Expr m = ValueExpr (Value m) | ReducibleExpr (m (Expr m))
 data Value m = IntVal Int | TextVal Text | BoolVal Bool | IOVal (m (Expr m)) | TupVal (Value m) (Value m) | FnVal (Value m -> m (Expr m)) | VoidVal
 
-
-type ProcMonad = ExceptT String (ReaderT Int (StateT Int DiscordHandler))
 
 class (MonadIO m) => MonadProc m where
   payGas :: Int -> m ()
@@ -61,14 +60,45 @@ class (MonadIO m) => MonadProc m where
   liftDiscord :: DiscordHandler a -> m a
   botError :: String -> m a
 
-instance MonadProc (ExceptT String (ReaderT Int (StateT Int DiscordHandler))) where
-  payGas n = modify (+ n)
-  getGas = get -- TODO what we really want is to get how much we have left, not how much we used
-  pushChanges = pure () -- TODO
-  descendStmt = local (+1)
-  getDepth = ask
-  liftDiscord = lift . lift . lift
-  botError s = except (Left s)
+newtype ProcMonad a = ProcMonad { runProcMonad :: ExceptT String (ReaderT (TVar (ProcState ProcMonad),Int) (StateT (ProcState ProcMonad, Int) DiscordHandler)) a } deriving (Functor)
+-- TODO maybe use GeneralizedNewtypeDeriving
+
+instance Applicative ProcMonad where
+  a <*> b = ProcMonad $ runProcMonad a <*> runProcMonad b
+  pure a = ProcMonad $ pure a
+
+instance Monad ProcMonad where
+  a >>= b = ProcMonad $ runProcMonad a >>= runProcMonad . b
+
+instance MonadIO ProcMonad where
+  liftIO a = ProcMonad $ liftIO a
+
+instance MonadState (ProcState ProcMonad, Int) ProcMonad where
+  get = ProcMonad get
+  put v = ProcMonad $ put v
+
+instance MonadReader (TVar (ProcState ProcMonad),Int) ProcMonad where
+  ask = ProcMonad ask
+  local f x = ProcMonad $ local f (runProcMonad x)
+  
+
+instance MonadProc ProcMonad where
+  payGas n = do
+    modify $ fmap (+ n)
+    g <- gets snd
+    if (g > 2000) then pushChanges else pure ()
+  getGas = gets snd -- gets f where f (a,b) = gasLeft a - b
+  pushChanges = do
+    tv <- reader fst
+    (state,gasUsed) <- get
+    newGas <- liftIO . atomically . stateTVar tv $ (\s -> let g' = gasLeft s - gasUsed in (g', s { gasLeft = g' }))
+    newChannels <- liftIO $ channelsAllowed <$> readTVarIO tv
+    let state' = state { channelsAllowed = newChannels, gasLeft = newGas }
+    put (state, 0) -- TODO halt if out of gas
+  descendStmt = local $ fmap (+1)
+  getDepth = reader snd
+  liftDiscord = ProcMonad . lift . lift . lift
+  botError s = pushChanges >> ProcMonad (except (Left s))
 
 simplExpr :: (MonadProc m) => Expr m -> m (Value m)
 simplExpr (ValueExpr x) = pure x
@@ -83,15 +113,19 @@ runExpr e = do
 
 runCode :: TVar (LamBotState ProcMonad) -> Message -> PID -> Text -> DiscordHandler ()
 runCode s msg pid fn = do
-  fnCode <- liftIO . atomically $ (M.lookup pid . procList >=> M.lookup fn . procCode) <$> readTVar s
-  let channelVal = IntVal . fromIntegral $ messageChannelId msg
-  let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
-  let contentVal = TextVal $ messageContent msg
-  let call a b = ReducibleExpr (appExprSimplF a b)
-  -- TODO runStateT not evalStateT, since we'll be writing to the global state eventually
-  res <- flip evalStateT 0 $ flip runReaderT 0 $ runExceptT $ maybe (pure ()) (void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal)) fnCode
-  case res of
-    Left e -> sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
+  fnState_ <- liftIO $ (M.lookup pid . procList) <$> readTVarIO s
+  fnCode_ <- maybe (pure Nothing) (liftIO . fmap (M.lookup fn . procCode) . readTVarIO) fnState_
+  case (fnState_,fnCode_) of
+    (Just fnState, Just fnCode) -> do
+      let channelVal = IntVal . fromIntegral $ messageChannelId msg
+      let authorVal  = IntVal . fromIntegral . userId $ messageAuthor msg
+      let contentVal = TextVal $ messageContent msg
+      let call a b = ReducibleExpr (appExprSimplF a b)
+      stateVal <- liftIO $ readTVarIO fnState
+      res <- flip evalStateT (stateVal,0) . flip runReaderT (fnState,0) . runExceptT . runProcMonad . void . runExpr . (`call` contentVal) . (`call` authorVal) . (`call` channelVal) $ fnCode
+      case res of
+        Left e -> sendMsgM msg ("Execution of program " <> pack (show pid) <> " failed: " <> pack e)
+        _ -> pure ()
     _ -> pure ()
 
 appExpr (FnVal f) x = getDepth >>= payGas >> f x
@@ -279,16 +313,16 @@ delayFn _ _ = botError "Expected int"
 sendMsg c msg = restCall (R.CreateMessage c msg) >> pure ()
 sendMsgM m = sendMsg (messageChannelId m)
 
-addBot :: Code m -> State (LamBotState m) PID
-addBot c = do
-  s <- get
-  let pid = maxPID s + 1
-  put $ s {
-    procList = M.insert pid (def { procCode = c }) (procList s),
-    maxPID = pid
-  }
-  return pid
+newBotState :: Code m -> IO (TVar (ProcState m))
+newBotState c = newTVarIO $ def { procCode = c }
 
+addBot :: (TVar (ProcState m)) -> LamBotState m -> (PID, LamBotState m)
+addBot c s = let pid = maxPID s + 1 in (pid, s { procList = M.insert pid c (procList s), maxPID = pid })
+
+addBotIO :: (Code m) -> TVar (LamBotState m) -> IO PID
+addBotIO c s = do
+  botState <- newBotState c
+  atomically . stateTVar s $ addBot botState
 
 addStdLib :: String -> TVar (LamBotState ProcMonad) -> IO ()
 addStdLib fname state = do
@@ -297,7 +331,7 @@ addStdLib fname state = do
     Left e -> error $ "Parse error: " <> show e
     Right c -> do
       c' <- c
-      pid <- atomically . stateTVar state . runState $ addBot c'
+      pid <- addBotIO c' state
       putStrLn $ "Added stlib with pid " <> show pid
 
 
@@ -311,15 +345,15 @@ msgContentHandler s m | "_addProc " `isPrefixOf` messageContent m = do
       case c' of
         Left pid -> sendMsgM m . pack $ "Couldn't find process with PID " <> show pid
         Right code -> do
-          pid <- liftIO . atomically . stateTVar s . runState $ addBot code
+          pid <- liftIO $ addBotIO code s
           sendMsgM m $ pack $ "Created process with ID " <> show pid
           -- TODO enable bot in this channel
           runCode s m pid "start"
   where
     getCode :: PID -> ExceptT PID DiscordHandler (Code ProcMonad)
     getCode pid = do
-      thisProc <- liftIO $ atomically $ M.lookup pid . procList <$> readTVar s
-      maybe (except (Left pid)) (pure . procCode) thisProc
+      thisProc <- liftIO $ M.lookup pid . procList <$> readTVarIO s
+      maybe (except (Left pid)) (liftIO . fmap procCode . readTVarIO) thisProc
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO . atomically $ M.keys . procList <$> readTVar s
