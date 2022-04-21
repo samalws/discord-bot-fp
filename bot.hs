@@ -34,11 +34,12 @@ import qualified Discord.Requests as R
 -- TODO remove unused imports (how?)
 -- TODO eventually write bots to a file in order to not have to keep them in memory
 -- TODO add allowedList command; make a map from channel to allowed PIDs
+-- TODO add short circuiting and then maybe also add a bind operator that ignores the result
 
-startGas = 10000
+startGas = 100000
 refuelGas = startGas
 gasPushThresh = 2000
-sendFnGas = 200
+sendFnGas = 1000
 sendFnPause = 500000
 binOpGas = 1
 
@@ -106,7 +107,7 @@ runExpr e = do
   e' <- simplExpr e
   case e' of
     IOVal x -> x
-    _ -> botError "Expected IO"
+    _ -> botError "Expected IO when running"
 
 runCode :: TVar (LamBotState ProcMonad) -> Message -> PID -> Text -> DiscordHandler ()
 runCode s msg pid fn = void . runMaybeT $ do
@@ -123,7 +124,7 @@ runCode s msg pid fn = void . runMaybeT $ do
     _ -> pure ()
 
 appExpr (FnVal f) x = getDepth >>= payGas >> f x
-appExpr _ _ = botError "Expected function"
+appExpr _ _ = botError "Expected function when applying"
 
 appExprSimplX f x = descendStmt (simplExpr x) >>= appExpr f
 
@@ -154,7 +155,7 @@ ifParser = f <$> g "if" <*> g "then" <*> (string "else" >> spaces >> exprParser)
     case a' of
       (BoolVal True) -> pure (b v)
       (BoolVal False) -> pure (c v)
-      _ -> botError "Expected boolean"
+      _ -> botError "Expected boolean in if statement"
 
 varParser :: (MonadProc m) => Parser (Code m -> Expr m)
 varParser = f <$> varNameParser where
@@ -240,37 +241,42 @@ ops :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
 ops = otherOps ++ numOps ++ numBoolOps
 
 otherOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-otherOps = [("+",addOp),(">>",bindOp),("&",andOp),("|",orOp),("==",eqOp)]
+otherOps = [("+",addOp),(">>",bindOp),("&",andOp),("|",orOp),("==",eqOp),("!=",neqOp)]
 
 numOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-numOps = fmap numOp <$> [("-",(-)),("*",(*)),("/",div),("%",mod),("^",(^))]
+numOps = let f (a,b) = (a,numOp b a) in f <$> [("-",(-)),("*",(*)),("/",div),("%",mod),("^",(^))]
 
 numBoolOps :: (MonadProc m) => [(String, Value m -> Value m -> m (Expr m))]
-numBoolOps = fmap numBoolOp <$> [(">=",(>=)),("<=",(<=)),(">",(>)),("<",(<))]
+numBoolOps = let f (a,b) = (a,numBoolOp b a) in f <$> [(">=",(>=)),("<=",(<=)),(">",(>)),("<",(<))]
 
-numOp op (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a `op` b
-numOp _ _ _ = botError "Expected number"
+numOp op _ (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a `op` b
+numOp _ opName _ _ = botError ("Expected number in " <> opName)
 
-numBoolOp op (IntVal a) (IntVal b) = pure . ValueExpr . BoolVal $ a `op` b
-numBoolOp _ _ _ = botError "Expected number"
+numBoolOp op _ (IntVal a) (IntVal b) = pure . ValueExpr . BoolVal $ a `op` b
+numBoolOp _ opName _ _ = botError ("Expected number in " <> opName)
 
 addOp (IntVal a) (IntVal b) = pure . ValueExpr . IntVal $ a + b
 addOp (TextVal a) (TextVal b) = pure . ValueExpr . TextVal $ a <> b
-addOp _ _ = botError "Expected number or string"
+addOp _ _ = botError "Expected number or string in +"
 
 bindOp (IOVal a) b = pure . ValueExpr . IOVal $ a >>= appExprSimplX b >>= runExpr
-bindOp _ _ = botError "Expected IO and function"
+bindOp _ _ = botError "Expected IO and function in >>"
 
 andOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a && b
-andOp _ _ = botError "Expected boolean"
+andOp _ _ = botError "Expected boolean in &"
 
 orOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a || b
-orOp _ _ = botError "Expected boolean"
+orOp _ _ = botError "Expected boolean in |"
 
 eqOp (IntVal  a) (IntVal  b) = pure . ValueExpr . BoolVal $ a == b
 eqOp (TextVal a) (TextVal b) = pure . ValueExpr . BoolVal $ a == b
 eqOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a == b
-eqOp _ _ = botError "Expected number, string, or boolean"
+eqOp _ _ = botError "Expected number, string, or boolean in =="
+
+neqOp (IntVal  a) (IntVal  b) = pure . ValueExpr . BoolVal $ a /= b
+neqOp (TextVal a) (TextVal b) = pure . ValueExpr . BoolVal $ a /= b
+neqOp (BoolVal a) (BoolVal b) = pure . ValueExpr . BoolVal $ a /= b
+neqOp _ _ = botError "Expected number, string, or boolean in !="
 
 
 codeDefaults :: (MonadProc m) => [(Text, Expr m)]
@@ -292,10 +298,10 @@ twoArityHelper f = ValueExpr (FnVal $ pure . oneArityHelper . f)
 threeArityHelper f = ValueExpr (FnVal $ pure . twoArityHelper . f)
 
 substrFn (IntVal a) (IntVal b) (TextVal t) = pure . ValueExpr . TextVal . T.take (b - a) $ T.drop a t
-substrFn _ _ _ = botError "Expected int, int, and string"
+substrFn _ _ _ = botError "Expected int, int, and string in substr"
 
 lenFn (TextVal t) = pure . ValueExpr . IntVal $ T.length t
-lenFn _ = botError "Expected string"
+lenFn _ = botError "Expected string in len"
 
 sendMsgFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ do
   payGas sendFnGas
@@ -308,10 +314,10 @@ sendMsgFn (IntVal c) (TextVal t) = pure . ValueExpr . IOVal $ do
     Just AllowedNoPrefix -> liftDiscord (sendMsg (fromIntegral c) t)
   liftIO (threadDelay sendFnPause)
   pure (ValueExpr . BoolVal $ isJust allowed)
-sendMsgFn _ _ = botError "Expected channel ID and string"
+sendMsgFn _ _ = botError "Expected channel ID and string in sendMsg"
 
 delayFn mul (IntVal x) = pure . ValueExpr . IOVal $ payGas 5 >> pushChanges >> liftIO (threadDelay (mul * x)) >> pure (ValueExpr VoidVal)
-delayFn _ _ = botError "Expected int"
+delayFn _ _ = botError "Expected int in delay"
 
 
 sendMsg c msg = void . restCall $ R.CreateMessage c msg
@@ -356,7 +362,7 @@ msgContentHandler s m | onCmdList (messageContent m) = void . sequence $ ($ m) .
 msgContentHandler s m = do
   r <- ask
   ks <- liftIO $ M.keys . procList <$> readTVarIO s
-  void . liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "msg" <$> ks
+  void . liftIO . sequence $ forkIO . flip runReaderT r . flip (runCode s m) "message" <$> ks
 
 onCmdList s = any (`isPrefixOf` s) $ fst <$> cmdList
 
